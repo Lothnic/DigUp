@@ -1,0 +1,154 @@
+name: Validate PR 114 on macOS
+on:
+  push:
+    branches: [codex/validate-pr-114]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Engine tests, FSEvents, app build, and benchmark
+        run: |
+          python3 -u - <<'PYVALIDATE'
+          import glob
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import statistics
+          import subprocess
+          import tempfile
+          
+          repo = Path(os.environ['GITHUB_WORKSPACE'])
+          temp = Path(os.environ['RUNNER_TEMP']) / 'pr114-validation'
+          temp.mkdir(exist_ok=True)
+          xcode = glob.glob('/Applications/Xcode_*.app')
+          if xcode:
+              latest = max(xcode, key=lambda x: tuple(map(int, re.findall(r'\d+', Path(x).name))))
+              os.environ['DEVELOPER_DIR'] = latest + '/Contents/Developer'
+          
+          def run(args, **kw):
+              print('+', ' '.join(map(str, args)), flush=True)
+              return subprocess.run(list(map(str, args)), check=True, **kw)
+          
+          run(['swift', '--version'])
+          run(['xcodebuild', '-version'])
+          run(['git', 'rev-parse', 'HEAD'])
+          
+          benchmark = r'''
+          import Foundation
+          import DigUpKit
+          let fixture = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+          let store = try IndexStore(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
+          let label = CommandLine.arguments[3]
+          let roots = (0..<7).map { fixture.appendingPathComponent("root\($0)") }
+          let note = roots[0].appendingPathComponent("folder0/note0.txt")
+          let indexer = try Indexer(store: store, options: IndexOptions(), makeEmbedder: { throw WorkerError.notFound("metadata benchmark") })
+          _ = try indexer.sync(roots)
+          var times: [Double] = []
+          var walked = 0
+          for i in 0..<5 {
+              try Data("edited note \(i)".utf8).write(to: note)
+              let start = ProcessInfo.processInfo.systemUptime
+              let result: Indexer.SyncSummary
+              #if SUPPORTS_PARTIAL
+              if label == "partial" { result = try indexer.sync(roots, changedPaths: [note.path]) }
+              else { result = try indexer.sync(roots) }
+              #else
+              result = try indexer.sync(roots)
+              #endif
+              times.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+              walked = result.crawl.candidates.count
+          }
+          let result: [String: Any] = ["label": label, "milliseconds": times, "candidates": walked]
+          let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+          print(String(decoding: data, as: UTF8.self))
+          '''
+          
+          watcher = r'''
+          import Foundation
+          import DigUpKit
+          final class Events: @unchecked Sendable {
+              let lock = NSLock()
+              let changed = DispatchSemaphore(value: 0)
+              var batches: [([String], Bool)] = []
+              func record(_ paths: [String], _ full: Bool) {
+                  lock.withLock { batches.append((paths, full)) }
+                  changed.signal()
+              }
+              func wait(_ predicate: ([String], Bool) -> Bool) -> Bool {
+                  let deadline = DispatchTime.now() + 10
+                  while changed.wait(timeout: deadline) == .success {
+                      if lock.withLock({ batches.contains { predicate($0.0, $0.1) } }) { return true }
+                  }
+                  return false
+              }
+          }
+          let fm = FileManager.default
+          let temporary = fm.temporaryDirectory.appendingPathComponent("DigUpWatchSmoke-\(UUID().uuidString)")
+          try fm.createDirectory(at: temporary, withIntermediateDirectories: true)
+          let root = URL(fileURLWithPath: FolderSelection.realPath(temporary.path), isDirectory: true)
+          defer { try? fm.removeItem(at: root) }
+          let events = Events()
+          guard let watcher = FolderWatcher(paths: [root.path], latency: 0.05, queue: DispatchQueue(label: "watch-smoke"), handler: { paths, full in events.record(paths, full) }) else { fatalError("couldn't start FSEvents") }
+          Thread.sleep(forTimeInterval: 0.25)
+          let note = root.appendingPathComponent("note.txt")
+          try Data("note".utf8).write(to: note)
+          guard events.wait({ paths, full in !full && paths.contains(note.path) }) else { fatalError("file event lost its changed path") }
+          try Data("ignored/".utf8).write(to: root.appendingPathComponent(".gitignore"))
+          guard events.wait({ paths, _ in paths.contains(root.path) }) else { fatalError("Git rule event didn't broaden to its containing folder") }
+          withExtendedLifetime(watcher) {}
+          print("FSEvents smoke passed: changed file path and hidden Git rule subtree")
+          '''
+          
+          def package(source, name, current):
+              folder = temp / name
+              (folder / 'Sources').mkdir(parents=True)
+              (folder / 'Tests').mkdir()
+              (folder / 'Sources/DigUpKit').symlink_to(source / 'Sources/DigUpKit', target_is_directory=True)
+              (folder / 'Tests/DigUpKitTests').symlink_to(source / 'Tests/DigUpKitTests', target_is_directory=True)
+              (folder / 'Sources/SyncBenchmark').mkdir()
+              (folder / 'Sources/SyncBenchmark/main.swift').write_text(benchmark)
+              flags = ', swiftSettings: [.define("SUPPORTS_PARTIAL")]' if current else ''
+              targets = ['.target(name: "DigUpKit")', '.testTarget(name: "DigUpKitTests", dependencies: ["DigUpKit"], exclude: ["Pictures", "Videos"])', '.executableTarget(name: "SyncBenchmark", dependencies: ["DigUpKit"]' + flags + ')']
+              if current:
+                  (folder / 'Sources/WatcherSmoke').mkdir()
+                  (folder / 'Sources/WatcherSmoke/main.swift').write_text(watcher)
+                  (folder / 'Sources/WatcherSmoke/FolderWatcher.swift').symlink_to(source / 'Sources/DigUpApp/FolderWatcher.swift')
+                  targets.append('.executableTarget(name: "WatcherSmoke", dependencies: ["DigUpKit"])')
+              (folder / 'Package.swift').write_text('// swift-tools-version: 6.2\nimport PackageDescription\nlet package = Package(name: "' + name + '", platforms: [.macOS(.v14)], targets: [' + ','.join(targets) + '])\n')
+              return folder
+          
+          current = package(repo, 'current', True)
+          run(['swift', 'test', '--package-path', current, '-j', '2', '--no-parallel'])
+          run(['swift', 'run', '--package-path', current, '-j', '2', 'WatcherSmoke'])
+          run(['swift', 'build', '--target', 'DigUpApp', '-j', '2'], cwd=repo)
+          run(['swiftc', '-frontend', '-parse', repo / 'Sources/digup/IndexService.swift'])
+          
+          base = temp / 'baseline-source'
+          run(['git', 'worktree', 'add', '--detach', base, 'ec28973268b81f836be72187ff23b3a16ef4fd97'], cwd=repo)
+          baseline = package(base, 'baseline', False)
+          fixture = temp / 'fixture'
+          for root in range(7):
+              for sub in range(20):
+                  directory = fixture / ('root' + str(root)) / ('folder' + str(sub))
+                  directory.mkdir(parents=True, exist_ok=True)
+                  for note in range(50):
+                      (directory / ('note' + str(note) + '.txt')).write_text('fixture note')
+          results = []
+          for pkg, label in [(baseline, 'baseline-full'), (current, 'current-full'), (current, 'partial')]:
+              completed = run(['swift', 'run', '--package-path', pkg, '-j', '2', 'SyncBenchmark', fixture, temp / ('index-' + label), label], capture_output=True, text=True)
+              print(completed.stderr)
+              print(completed.stdout)
+              results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
+          summary = ['## Incremental sync validation', '', 'macOS engine tests, FSEvents smoke, and DigUpApp build passed.', '', 'Synthetic warm filesystem benchmark: 7 selected roots, 7,000 text files, 5 metadata syncs per mode.']
+          for result in results:
+              median = statistics.median(result['milliseconds'])
+              summary.append('- ' + result['label'] + ': median ' + format(median, '.2f') + ' ms; ' + str(result['candidates']) + ' candidates visited.')
+          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('\n'.join(summary) + '\n')
+          PYVALIDATE
